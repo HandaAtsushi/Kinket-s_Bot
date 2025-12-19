@@ -10,6 +10,8 @@ import { env } from "process";
 const GREETING =
   '参加ありがとう！はじめるときは「カラキン」って送ってね（やめるときは「カラキンばいばい」）';
 
+type Reply = line.messagingApi.Message | line.messagingApi.Message[];
+
 // ===== MVP: RoomIdなし（グローバル1進行） =====
 
 // 「何番目のPhaseか」＋「Phase内で何を待っているか」だけを状態として持つ
@@ -132,10 +134,32 @@ const phases: Phase[] = [
 ];
 
 // ===== 文言テンプレ =====
+// ボタン生成関数
+function renderSongButtons(question: string, songs: string[]): line.messagingApi.TemplateMessage {
+  const actions = songs.slice(0, 4).map((s) => ({
+    type: "message" as const,
+    label: s.length > 20 ? s.slice(0, 20) : s,
+    text: s,
+  }));
+  return {
+    type: "template",
+    altText: `${question} ${songs.join(" / ")}`,
+    template: {
+      type: "buttons",
+      text: question,
+      actions,
+    },
+  };
+}
 
 function pickSongs(phase: Phase, moreCount: number): string[] {
   const idx = Math.min(moreCount, phase.songPools.length - 1);
   return phase.songPools[idx];
+}
+
+//String→Messageに変換するヘルパー
+function textMsg(text: string): line.messagingApi.Message {
+  return { type: "text", text };
 }
 
 function renderStart(): string {
@@ -150,7 +174,7 @@ function renderStart(): string {
   ].join("\n");
 }
 
-function renderChoose(phase: Phase, songs: string[]): string {
+function renderChoose(phase: Phase, songs: string[]): Reply {
   const lines: string[] = [];
   lines.push(...phase.descriptionLines);
   lines.push("");
@@ -161,12 +185,22 @@ function renderChoose(phase: Phase, songs: string[]): string {
     lines.push("");
   }
 
-  lines.push("たとえばこんな曲はどうかな？");
-  lines.push(...songs.map((s) => `・${s}`));
-  lines.push("");
-  lines.push(phase.choosePrompt);
+  // ① ルール説明はテキスト
+  const ruleText: line.messagingApi.Message = {
+    type: "text",
+    text: lines.join("\n"),
+  };
 
-  return lines.join("\n");
+  // ② 曲選択はボタン（最大4件）
+  const buttons = renderSongButtons("次は何を歌いますか？", songs);
+
+  // ③ 促しはテキスト（「決まった！」「他の曲を教えて」等）
+  const promptText: line.messagingApi.Message = {
+    type: "text",
+    text: phase.choosePrompt,
+  };
+
+  return [ruleText, buttons, promptText];
 }
 
 function renderReserve(): string {
@@ -203,13 +237,13 @@ function renderUnknown(): string {
  * Phaseは配列 phases を増やすだけで拡張可能
  * 末尾Phaseが終わったら終了（あなたの指定：選択肢2）
  */
-function createReply(message: string): string | undefined {
+function createReply(message: string): Reply | undefined {
   const intent = detectIntent(message);
 
   // 共通終了
   if (intent === "EXIT") {
     step = "ENDED";
-    return renderEnd();
+    return textMsg(renderEnd());
   }
 
   // 開始（IDLE/ENDEDのみ）
@@ -217,37 +251,46 @@ function createReply(message: string): string | undefined {
     step = "AWAIT_ACK";
     phaseIndex = 0;
     moreCounts = [];
-    return renderStart();
+    return textMsg(renderStart());
   }
 
   // 以降、ステップごとに処理
   if (step === "AWAIT_ACK") {
-    if (intent !== "ACK") return renderUnknown();
+    if (intent !== "ACK") return textMsg(renderUnknown());
     step = "AWAIT_CHOOSE";
     ensureMoreCountsSize(phases.length);
     const phase = phases[phaseIndex];
     return renderChoose(phase, pickSongs(phase, moreCounts[phaseIndex]));
   }
 
-  if (step === "AWAIT_CHOOSE") {
-    ensureMoreCountsSize(phases.length);
-    const phase = phases[phaseIndex];
+if (step === "AWAIT_CHOOSE") {
+  ensureMoreCountsSize(phases.length);
+  const phase = phases[phaseIndex];
+  const currentSongs = pickSongs(phase, moreCounts[phaseIndex]);
 
-    if (intent === "MORE") {
-      moreCounts[phaseIndex] += 1;
-      return renderChoose(phase, pickSongs(phase, moreCounts[phaseIndex]));
-    }
-
-    if (intent === "DECIDED") {
-      step = "AWAIT_FINISH";
-      return renderReserve();
-    }
-
-    return renderUnknown();
+  if (intent === "MORE") {
+    moreCounts[phaseIndex] += 1;
+    return renderChoose(phase, pickSongs(phase, moreCounts[phaseIndex]));
   }
 
+  // ★追加：ボタンで送信された「曲名」を決定扱いにする
+  const norm = normalize(message);
+  const isSongSelected = currentSongs.some((s) => normalize(s) === norm);
+  if (isSongSelected) {
+    step = "AWAIT_FINISH";
+    return textMsg(renderReserve());
+  }
+
+  if (intent === "DECIDED") {
+    step = "AWAIT_FINISH";
+    return textMsg(renderReserve());
+  }
+
+  return textMsg(renderUnknown());
+}
+
   if (step === "AWAIT_FINISH") {
-    if (intent !== "FINISHED") return renderUnknown();
+    if (intent !== "FINISHED") return textMsg(renderUnknown());
 
     // 次のPhaseへ
     phaseIndex += 1;
@@ -255,7 +298,7 @@ function createReply(message: string): string | undefined {
     // 末尾まで行ったら終了（選択肢2）
     if (phaseIndex >= phases.length) {
       step = "ENDED";
-      return renderEnd();
+      return textMsg(renderEnd());
     }
 
     step = "AWAIT_CHOOSE";
@@ -264,7 +307,7 @@ function createReply(message: string): string | undefined {
     return renderChoose(nextPhase, pickSongs(nextPhase, moreCounts[phaseIndex]));
   }
 
-  return renderUnknown();
+  return textMsg(renderUnknown());
 }
 
 const { MessagingApiClient } = line.messagingApi;
@@ -284,13 +327,12 @@ async function handleEvent(
   } else if (event.type === "message" && event.message.type === "text") {
     const reply = createReply(event.message.text);
     if (reply !== undefined) {
+      const messages = Array.isArray(reply) ? reply : [reply];
       await client.replyMessage({
         replyToken: event.replyToken,
-        messages: [{ type: "text", text: reply }],
+        messages,
       });
-      console.log(
-        `メッセージ「${event.message.text}」に「${reply}」と返信しました`,
-      );
+      console.log(`メッセージ「${event.message.text}」に返信しました`);
     } else {
       console.log(`メッセージ「${event.message.text}」を無視しました`);
     }
